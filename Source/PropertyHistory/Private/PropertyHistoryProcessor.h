@@ -60,5 +60,11 @@ public:
 
 private:
 	UScriptStruct* TargetStampStruct = nullptr;
+	// Tracks the inner ScriptStruct of the FInstancedStruct that the current Container
+	// belongs to (if any). Used during cross-revision Diff to validate that
+	// ChildData.Property actually belongs to that struct, preventing wild-memory reads
+	// when an older asset's InstancedStruct was reset to empty due to a missing
+	// UScriptStruct during deserialization.
+	const UScriptStruct* CurrentInstancedStructType = nullptr;
 	bool bFetchMaterialParameterName = false;
 };

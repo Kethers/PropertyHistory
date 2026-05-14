@@ -44,6 +44,29 @@ bool FPropertyHistoryProcessor::Process(void*& Container)
 		const FPropertyData& Data = Properties[Index];
 		FPropertyData& ChildData = Properties[Index - 1];
 
+		// During cross-revision Diff, an older asset's FInstancedStruct may have been reset to empty by the engine when its UScriptStruct 
+		// could not be resolved. On each iteration, verify that the current property actually belongs to the
+		// parent-level InstancedStruct's inner struct, so we don't follow PropertyChain offsets into wild memory.
+		if (CurrentInstancedStructType != nullptr &&
+			Data.Property != nullptr)
+		{
+			const UStruct* OwnerStruct = Data.Property->GetOwnerStruct();
+			if (OwnerStruct == nullptr ||
+				!CurrentInstancedStructType->IsChildOf(OwnerStruct))
+			{
+				return false;
+			}
+
+			// Meeting the concrete property inside the InstancedStruct;
+			// the context check is no longer needed for subsequent iterations.
+			CurrentInstancedStructType = nullptr;
+		}
+
+		if (Container == nullptr)
+		{
+			return false;
+		}
+
 		if (const FStructProperty* StructProperty = CastField<FStructProperty>(Data.Property))
 		{
 			if (!ProcessStruct(Container, Data, ChildData))
@@ -226,10 +249,30 @@ bool FPropertyHistoryProcessor::ProcessStruct(
 			return false;
 		}
 
+		const UScriptStruct* InnerScriptStruct = InstancedStruct->GetScriptStruct();
+		if (InnerScriptStruct == nullptr)
+		{
+			return false;
+		}
+
 		if (const FStructProperty* ChildStructProperty = CastField<FStructProperty>(ChildData.Property))
 		{
+			// ChildData may still be the FInstancedStruct itself (a wrapper level) or the inner concrete struct; reject anything else.
 			if (ChildStructProperty->Struct != FInstancedStruct::StaticStruct() &&
-				ChildStructProperty->Struct != InstancedStruct->GetScriptStruct())
+				ChildStructProperty->Struct != InnerScriptStruct &&
+				!InnerScriptStruct->IsChildOf(ChildStructProperty->GetOwnerStruct()))
+			{
+				return false;
+			}
+		}
+		else if (ChildData.Property != nullptr)
+		{
+			// Non-StructProperty (array / object / plain field, etc.): require its owner struct to be the InstancedStruct's inner ScriptStruct 
+			// or one of its ancestors. Otherwise, treat the PropertyChain as mismatched against the older revision's layout 
+			// and bail out to avoid wild-pointer access.
+			const UStruct* ChildOwner = ChildData.Property->GetOwnerStruct();
+			if (ChildOwner == nullptr ||
+				!InnerScriptStruct->IsChildOf(ChildOwner))
 			{
 				return false;
 			}
@@ -240,6 +283,9 @@ bool FPropertyHistoryProcessor::ProcessStruct(
 		{
 			return false;
 		}
+
+		// Record the context so the main loop can validate DataProperty's ownership on the next iteration.
+		CurrentInstancedStructType = InnerScriptStruct;
 
 		return true;
 	}
@@ -342,8 +388,19 @@ bool FPropertyHistoryProcessor::ProcessArray(
 	const FArrayProperty* Property,
 	const FPropertyData& ChildData) const
 {
+	if (Container == nullptr || Property == nullptr)
+	{
+		return false;
+	}
+
 	FScriptArrayHelper ArrayHelper(Property, Container);
 	const int32 ArraySize = ArrayHelper.Num();
+
+	// If FScriptArray::ArrayNum reads as an obviously invalid value (negative or excessively large), the upstream Container is likely wild memory; bail out.
+	if (ArraySize < 0 || ArraySize > (1 << 24))
+	{
+		return false;
+	}
 
 	if (const FProperty* ComparisonProperty = GetMaterialParameterComparisonProperty(Property))
 	{
